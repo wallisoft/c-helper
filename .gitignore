@@ -1,5 +1,17 @@
-__pycache__/
-*.pyc
-*.pyo
+# c-helper
+c-helper.db
+c-helper.db-journal
+.env
+
+# Logs
 *.log
+
+# OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

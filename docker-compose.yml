@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  c-helper:
+    build: .
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./data:/app/data
+      - ~/projects:/workspace
+    environment:
+      - C_HELPER_KEY=${C_HELPER_KEY:-dev-key-change-me}
+      - C_HELPER_DB=/app/data/c-helper.db
+      - C_HELPER_BASE=/workspace
+    restart: unless-stopped
