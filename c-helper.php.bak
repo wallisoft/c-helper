@@ -1,0 +1,689 @@
+<?php
+/**
+ * c-helper API Server - Universal Edition
+ * Autonomous development workflow for Claude
+ * 
+ * Features:
+ * - Create new projects from scratch
+ * - Support any build system (dotnet, make, npm, etc.)
+ * - Store source code in SQLite
+ * - Build projects directly
+ * - Return build output for autonomous fixing
+ * - Works for NEW or EXISTING projects
+ * 
+ * Usage: php -S localhost:8888 c-helper.php
+ */
+
+// Configuration
+define('API_KEY', getenv('C_HELPER_KEY') ?: 'change-me-in-production');
+define('DB_PATH', __DIR__ . '/c-helper.db');
+define('BASE_PATH', getenv('HOME') . '/Downloads');
+
+// CORS and headers
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type, X-API-Key');
+header('Content-Type: application/json');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit();
+}
+
+// Authentication
+function authenticate() {
+    $provided = $_SERVER['HTTP_X_API_KEY'] ?? '';
+    if ($provided !== API_KEY) {
+        respond(401, ['error' => 'Unauthorized']);
+    }
+}
+
+// Response helper
+function respond($code, $data) {
+    http_response_code($code);
+    echo json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    exit();
+}
+
+// Database setup
+function init_db() {
+    $db = new SQLite3(DB_PATH);
+    
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS source_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT NOT NULL,
+            path TEXT NOT NULL,
+            content TEXT NOT NULL,
+            modified DATETIME DEFAULT CURRENT_TIMESTAMP,
+            synced DATETIME,
+            UNIQUE(project, path)
+        )
+    ");
+    
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS build_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            success INTEGER,
+            output TEXT,
+            error TEXT,
+            duration_ms INTEGER
+        )
+    ");
+    
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS projects (
+            name TEXT PRIMARY KEY,
+            base_path TEXT NOT NULL,
+            build_command TEXT NOT NULL,
+            run_command TEXT,
+            init_command TEXT,
+            project_type TEXT,
+            created DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ");
+    
+    return $db;
+}
+
+// Execute command and return output
+function exec_command($command, $cwd = null) {
+    $start = microtime(true);
+    
+    $descriptors = [
+        0 => ['pipe', 'r'],
+        1 => ['pipe', 'w'],
+        2 => ['pipe', 'w']
+    ];
+    
+    $process = proc_open($command, $descriptors, $pipes, $cwd);
+    
+    if (!is_resource($process)) {
+        return [
+            'success' => false,
+            'stdout' => '',
+            'stderr' => 'Failed to start process',
+            'exit_code' => -1,
+            'duration_ms' => 0
+        ];
+    }
+    
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    
+    $exit_code = proc_close($process);
+    $duration = round((microtime(true) - $start) * 1000);
+    
+    return [
+        'success' => $exit_code === 0,
+        'stdout' => $stdout,
+        'stderr' => $stderr,
+        'exit_code' => $exit_code,
+        'duration_ms' => $duration
+    ];
+}
+
+// Create a new project
+function handle_create_project($db) {
+    $body = json_decode(file_get_contents('php://input'), true);
+    
+    $name = $body['name'] ?? '';
+    $type = $body['type'] ?? 'empty';
+    $template = $body['template'] ?? '';
+    
+    if (!$name) {
+        respond(400, ['error' => 'Missing project name']);
+    }
+    
+    $base_path = BASE_PATH . '/' . $name;
+    
+    // Check if project already exists in DB
+    $stmt = $db->prepare('SELECT name FROM projects WHERE name = :name');
+    $stmt->bindValue(':name', $name);
+    $result = $stmt->execute();
+    if ($result->fetchArray()) {
+        respond(409, ['error' => 'Project already registered in database']);
+    }
+    
+    // Create directory if doesn't exist
+    if (!is_dir($base_path)) {
+        if (!mkdir($base_path, 0755, true)) {
+            respond(500, ['error' => 'Failed to create project directory']);
+        }
+    }
+    
+    // Initialize based on type
+    $init_result = null;
+    $build_cmd = '';
+    $run_cmd = '';
+    $init_cmd = '';
+    
+    switch ($type) {
+        case 'dotnet-console':
+            $init_cmd = 'dotnet new console -f net8.0';
+            $build_cmd = 'dotnet build';
+            $run_cmd = 'dotnet run';
+            $init_result = exec_command($init_cmd, $base_path);
+            break;
+            
+        case 'dotnet-avalonia':
+            $init_cmd = 'dotnet new avalonia.app -f net8.0';
+            $build_cmd = 'dotnet build';
+            $run_cmd = 'dotnet run';
+            $init_result = exec_command($init_cmd, $base_path);
+            break;
+            
+        case 'dotnet-classlib':
+            $init_cmd = 'dotnet new classlib -f net8.0';
+            $build_cmd = 'dotnet build';
+            $run_cmd = '';
+            $init_result = exec_command($init_cmd, $base_path);
+            break;
+            
+        case 'empty':
+            // Just create empty directory - user provides everything
+            $build_cmd = $body['build_command'] ?? '';
+            $run_cmd = $body['run_command'] ?? '';
+            $init_result = ['success' => true, 'stdout' => 'Empty project created', 'stderr' => '', 'exit_code' => 0, 'duration_ms' => 0];
+            break;
+            
+        default:
+            // Custom template
+            if ($template) {
+                $init_cmd = $template;
+                $build_cmd = $body['build_command'] ?? 'make';
+                $run_cmd = $body['run_command'] ?? './run.sh';
+                $init_result = exec_command($init_cmd, $base_path);
+            } else {
+                respond(400, ['error' => 'Unknown project type and no template provided']);
+            }
+    }
+    
+    // Register project in database
+    $stmt = $db->prepare('
+        INSERT INTO projects (name, base_path, build_command, run_command, init_command, project_type) 
+        VALUES (:name, :path, :build, :run, :init, :type)
+    ');
+    $stmt->bindValue(':name', $name);
+    $stmt->bindValue(':path', $base_path);
+    $stmt->bindValue(':build', $build_cmd);
+    $stmt->bindValue(':run', $run_cmd);
+    $stmt->bindValue(':init', $init_cmd);
+    $stmt->bindValue(':type', $type);
+    $stmt->execute();
+    
+    respond(201, [
+        'success' => true,
+        'project' => $name,
+        'path' => $base_path,
+        'type' => $type,
+        'init_result' => $init_result
+    ]);
+}
+
+// Delete a project
+function handle_delete_project($db) {
+    $name = $_GET['project'] ?? '';
+    
+    if (!$name) {
+        respond(400, ['error' => 'Missing project name']);
+    }
+    
+    // Get project info
+    $stmt = $db->prepare('SELECT base_path FROM projects WHERE name = :name');
+    $stmt->bindValue(':name', $name);
+    $result = $stmt->execute();
+    $proj = $result->fetchArray(SQLITE3_ASSOC);
+    
+    if (!$proj) {
+        respond(404, ['error' => 'Project not found']);
+    }
+    
+    // Delete from database
+    $db->exec("DELETE FROM projects WHERE name = '$name'");
+    $db->exec("DELETE FROM source_files WHERE project = '$name'");
+    $db->exec("DELETE FROM build_log WHERE project = '$name'");
+    
+    respond(200, [
+        'success' => true,
+        'message' => 'Project removed from database (filesystem not touched)',
+        'project' => $name
+    ]);
+}
+
+// Get file
+function handle_get_file($db) {
+    $project = $_GET['project'] ?? '';
+    $path = $_GET['path'] ?? '';
+    
+    if (!$project || !$path) {
+        respond(400, ['error' => 'Missing project or path parameter']);
+    }
+    
+    // Try DB first
+    $stmt = $db->prepare('SELECT content, modified FROM source_files WHERE project = :project AND path = :path');
+    $stmt->bindValue(':project', $project);
+    $stmt->bindValue(':path', $path);
+    $result = $stmt->execute();
+    $row = $result->fetchArray(SQLITE3_ASSOC);
+    
+    if ($row) {
+        respond(200, [
+            'source' => 'database',
+            'content' => $row['content'],
+            'modified' => $row['modified']
+        ]);
+    }
+    
+    // Try filesystem
+    $stmt = $db->prepare('SELECT base_path FROM projects WHERE name = :project');
+    $stmt->bindValue(':project', $project);
+    $result = $stmt->execute();
+    $proj = $result->fetchArray(SQLITE3_ASSOC);
+    
+    if ($proj) {
+        $full_path = $proj['base_path'] . '/' . $path;
+        if (file_exists($full_path)) {
+            $content = file_get_contents($full_path);
+            respond(200, [
+                'source' => 'filesystem',
+                'content' => $content,
+                'modified' => date('Y-m-d H:i:s', filemtime($full_path))
+            ]);
+        }
+    }
+    
+    respond(404, ['error' => 'File not found']);
+}
+
+// Put file
+function handle_put_file($db) {
+    $project = $_GET['project'] ?? '';
+    $path = $_GET['path'] ?? '';
+    $content = file_get_contents('php://input');
+    
+    if (!$project || !$path) {
+        respond(400, ['error' => 'Missing project or path parameter']);
+    }
+    
+    $stmt = $db->prepare('
+        INSERT INTO source_files (project, path, content, modified) 
+        VALUES (:project, :path, :content, CURRENT_TIMESTAMP)
+        ON CONFLICT(project, path) DO UPDATE SET 
+            content = :content, 
+            modified = CURRENT_TIMESTAMP,
+            synced = NULL
+    ');
+    $stmt->bindValue(':project', $project);
+    $stmt->bindValue(':path', $path);
+    $stmt->bindValue(':content', $content);
+    
+    if ($stmt->execute()) {
+        respond(200, [
+            'success' => true,
+            'message' => 'File stored in database',
+            'project' => $project,
+            'path' => $path,
+            'size' => strlen($content)
+        ]);
+    } else {
+        respond(500, ['error' => 'Database error']);
+    }
+}
+
+// Sync database to filesystem
+function handle_sync($db) {
+    $project = $_GET['project'] ?? '';
+    
+    if (!$project) {
+        respond(400, ['error' => 'Missing project parameter']);
+    }
+    
+    // Get project info
+    $stmt = $db->prepare('SELECT base_path FROM projects WHERE name = :project');
+    $stmt->bindValue(':project', $project);
+    $result = $stmt->execute();
+    $proj = $result->fetchArray(SQLITE3_ASSOC);
+    
+    if (!$proj) {
+        respond(404, ['error' => 'Project not found']);
+    }
+    
+    // Get unsynced files
+    $stmt = $db->prepare('SELECT path, content FROM source_files WHERE project = :project AND (synced IS NULL OR modified > synced)');
+    $stmt->bindValue(':project', $project);
+    $result = $stmt->execute();
+    
+    $synced = [];
+    $errors = [];
+    
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $full_path = $proj['base_path'] . '/' . $row['path'];
+        $dir = dirname($full_path);
+        
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+        
+        if (file_put_contents($full_path, $row['content']) !== false) {
+            $synced[] = $row['path'];
+            
+            // Update synced timestamp
+            $update = $db->prepare('UPDATE source_files SET synced = CURRENT_TIMESTAMP WHERE project = :project AND path = :path');
+            $update->bindValue(':project', $project);
+            $update->bindValue(':path', $row['path']);
+            $update->execute();
+        } else {
+            $errors[] = $row['path'];
+        }
+    }
+    
+    respond(200, [
+        'success' => count($errors) === 0,
+        'synced' => $synced,
+        'errors' => $errors,
+        'count' => count($synced)
+    ]);
+}
+
+// Build project
+function handle_build($db) {
+    $project = $_GET['project'] ?? '';
+    
+    if (!$project) {
+        respond(400, ['error' => 'Missing project parameter']);
+    }
+    
+    // Get project info
+    $stmt = $db->prepare('SELECT base_path, build_command FROM projects WHERE name = :project');
+    $stmt->bindValue(':project', $project);
+    $result = $stmt->execute();
+    $proj = $result->fetchArray(SQLITE3_ASSOC);
+    
+    if (!$proj) {
+        respond(404, ['error' => 'Project not found']);
+    }
+    
+    if (empty($proj['build_command'])) {
+        respond(400, ['error' => 'No build command configured for project']);
+    }
+    
+    // Execute build
+    $result = exec_command($proj['build_command'], $proj['base_path']);
+    
+    // Log build
+    $stmt = $db->prepare('
+        INSERT INTO build_log (project, success, output, error, duration_ms) 
+        VALUES (:project, :success, :output, :error, :duration)
+    ');
+    $stmt->bindValue(':project', $project);
+    $stmt->bindValue(':success', $result['success'] ? 1 : 0);
+    $stmt->bindValue(':output', $result['stdout']);
+    $stmt->bindValue(':error', $result['stderr']);
+    $stmt->bindValue(':duration', $result['duration_ms']);
+    $stmt->execute();
+    
+    respond(200, $result);
+}
+
+// Run project
+function handle_run($db) {
+    $project = $_GET['project'] ?? '';
+    $args = $_GET['args'] ?? '';
+    
+    if (!$project) {
+        respond(400, ['error' => 'Missing project parameter']);
+    }
+    
+    // Get project info
+    $stmt = $db->prepare('SELECT base_path, run_command FROM projects WHERE name = :project');
+    $stmt->bindValue(':project', $project);
+    $result = $stmt->execute();
+    $proj = $result->fetchArray(SQLITE3_ASSOC);
+    
+    if (!$proj) {
+        respond(404, ['error' => 'Project not found']);
+    }
+    
+    if (empty($proj['run_command'])) {
+        respond(400, ['error' => 'No run command configured for project']);
+    }
+    
+    $command = $proj['run_command'];
+    if ($args) {
+        $command .= ' ' . $args;
+    }
+    
+    $result = exec_command($command, $proj['base_path']);
+    respond(200, $result);
+}
+
+// Execute arbitrary command
+function handle_exec($db) {
+    $body = json_decode(file_get_contents('php://input'), true);
+    $command = $body['command'] ?? '';
+    $cwd = $body['cwd'] ?? BASE_PATH;
+    
+    if (!$command) {
+        respond(400, ['error' => 'Missing command']);
+    }
+    
+    $result = exec_command($command, $cwd);
+    respond(200, $result);
+}
+
+// List files in project
+function handle_list($db) {
+    $project = $_GET['project'] ?? '';
+    $source = $_GET['source'] ?? 'both'; // database, filesystem, or both
+    
+    if (!$project) {
+        respond(400, ['error' => 'Missing project parameter']);
+    }
+    
+    $files = [];
+    
+    // Get from database
+    if ($source === 'database' || $source === 'both') {
+        $stmt = $db->prepare('SELECT path, modified, synced FROM source_files WHERE project = :project ORDER BY path');
+        $stmt->bindValue(':project', $project);
+        $result = $stmt->execute();
+        
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $files[] = array_merge($row, ['source' => 'database']);
+        }
+    }
+    
+    // Get from filesystem
+    if ($source === 'filesystem' || $source === 'both') {
+        $stmt = $db->prepare('SELECT base_path FROM projects WHERE name = :project');
+        $stmt->bindValue(':project', $project);
+        $result = $stmt->execute();
+        $proj = $result->fetchArray(SQLITE3_ASSOC);
+        
+        if ($proj && is_dir($proj['base_path'])) {
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($proj['base_path'], RecursiveDirectoryIterator::SKIP_DOTS)
+            );
+            
+            foreach ($iterator as $file) {
+                if ($file->isFile()) {
+                    $rel_path = str_replace($proj['base_path'] . '/', '', $file->getPathname());
+                    
+                    // Skip if already in database list
+                    $in_db = false;
+                    foreach ($files as $f) {
+                        if ($f['path'] === $rel_path && $f['source'] === 'database') {
+                            $in_db = true;
+                            break;
+                        }
+                    }
+                    
+                    if (!$in_db) {
+                        $files[] = [
+                            'path' => $rel_path,
+                            'modified' => date('Y-m-d H:i:s', $file->getMTime()),
+                            'synced' => null,
+                            'source' => 'filesystem'
+                        ];
+                    }
+                }
+            }
+        }
+    }
+    
+    respond(200, ['project' => $project, 'files' => $files, 'count' => count($files)]);
+}
+
+// Show changes (unsynced files)
+function handle_changes($db) {
+    $project = $_GET['project'] ?? '';
+    
+    if (!$project) {
+        respond(400, ['error' => 'Missing project parameter']);
+    }
+    
+    $stmt = $db->prepare('SELECT path, modified FROM source_files WHERE project = :project AND (synced IS NULL OR modified > synced) ORDER BY modified DESC');
+    $stmt->bindValue(':project', $project);
+    $result = $stmt->execute();
+    
+    $changes = [];
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $changes[] = $row;
+    }
+    
+    respond(200, ['project' => $project, 'changes' => $changes, 'count' => count($changes)]);
+}
+
+// List all projects
+function handle_projects($db) {
+    $result = $db->query('SELECT name, base_path, project_type, created FROM projects ORDER BY created DESC');
+    
+    $projects = [];
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $projects[] = $row;
+    }
+    
+    respond(200, ['projects' => $projects, 'count' => count($projects)]);
+}
+
+// Get build log
+function handle_build_log($db) {
+    $project = $_GET['project'] ?? '';
+    $limit = $_GET['limit'] ?? 10;
+    
+    if ($project) {
+        $stmt = $db->prepare('SELECT * FROM build_log WHERE project = :project ORDER BY timestamp DESC LIMIT :limit');
+        $stmt->bindValue(':project', $project);
+        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
+    } else {
+        $stmt = $db->prepare('SELECT * FROM build_log ORDER BY timestamp DESC LIMIT :limit');
+        $stmt->bindValue(':limit', $limit, SQLITE3_INTEGER);
+    }
+    
+    $result = $stmt->execute();
+    $logs = [];
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $logs[] = $row;
+    }
+    
+    respond(200, ['logs' => $logs, 'count' => count($logs)]);
+}
+
+// Router
+authenticate();
+$db = init_db();
+
+$method = $_SERVER['REQUEST_METHOD'];
+$path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+
+switch ($path) {
+    case '/api/project':
+        if ($method === 'POST') handle_create_project($db);
+        elseif ($method === 'DELETE') handle_delete_project($db);
+        else respond(405, ['error' => 'Method not allowed']);
+        break;
+        
+    case '/api/file':
+        if ($method === 'GET') handle_get_file($db);
+        elseif ($method === 'PUT') handle_put_file($db);
+        else respond(405, ['error' => 'Method not allowed']);
+        break;
+        
+    case '/api/sync':
+        if ($method === 'POST') handle_sync($db);
+        else respond(405, ['error' => 'Method not allowed']);
+        break;
+        
+    case '/api/build':
+        if ($method === 'POST') handle_build($db);
+        else respond(405, ['error' => 'Method not allowed']);
+        break;
+        
+    case '/api/run':
+        if ($method === 'POST') handle_run($db);
+        else respond(405, ['error' => 'Method not allowed']);
+        break;
+        
+    case '/api/exec':
+        if ($method === 'POST') handle_exec($db);
+        else respond(405, ['error' => 'Method not allowed']);
+        break;
+        
+    case '/api/list':
+        if ($method === 'GET') handle_list($db);
+        else respond(405, ['error' => 'Method not allowed']);
+        break;
+        
+    case '/api/changes':
+        if ($method === 'GET') handle_changes($db);
+        else respond(405, ['error' => 'Method not allowed']);
+        break;
+        
+    case '/api/projects':
+        if ($method === 'GET') handle_projects($db);
+        else respond(405, ['error' => 'Method not allowed']);
+        break;
+        
+    case '/api/build-log':
+        if ($method === 'GET') handle_build_log($db);
+        else respond(405, ['error' => 'Method not allowed']);
+        break;
+        
+    case '/':
+    case '/api':
+        respond(200, [
+            'name' => 'c-helper API - Universal Edition',
+            'version' => '2.0',
+            'description' => 'Create and build any project from scratch',
+            'endpoints' => [
+                'POST   /api/project (body: {name, type, template?, build_command?, run_command?})',
+                'DELETE /api/project?project=X',
+                'GET    /api/file?project=X&path=Y',
+                'PUT    /api/file?project=X&path=Y',
+                'POST   /api/sync?project=X',
+                'POST   /api/build?project=X',
+                'POST   /api/run?project=X&args=Y',
+                'POST   /api/exec (body: {command, cwd})',
+                'GET    /api/list?project=X&source=database|filesystem|both',
+                'GET    /api/changes?project=X',
+                'GET    /api/projects',
+                'GET    /api/build-log?project=X&limit=N'
+            ],
+            'project_types' => [
+                'dotnet-console',
+                'dotnet-avalonia',
+                'dotnet-classlib',
+                'empty (with custom commands)'
+            ]
+        ]);
+        break;
+        
+    default:
+        respond(404, ['error' => 'Not found']);
+}

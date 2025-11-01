@@ -1,0 +1,44 @@
+🔑 Generated API Key: dev-1761836300
+   Set C_HELPER_KEY environment variable to use a custom key
+
+🚀 Starting c-helper API server...
+   URL: http://0.0.0.0:8888
+   Key: dev-1761836300
+   DB:  /home/steve/Downloads/c-helper/c-helper.db
+
+Press Ctrl+C to stop
+
+[Thu Oct 30 14:58:20 2025] PHP 8.3.6 Development Server (http://0.0.0.0:8888) started
+🔑 Generated API Key: dev-1761836312
+   Set C_HELPER_KEY environment variable to use a custom key
+
+🚀 Starting c-helper API server...
+   URL: http://0.0.0.0:8888
+   Key: dev-1761836312
+   DB:  /home/steve/Downloads/c-helper/c-helper.db
+
+Press Ctrl+C to stop
+
+[Thu Oct 30 14:58:32 2025] PHP 8.3.6 Development Server (http://0.0.0.0:8888) started
+🔑 Generated API Key: dev-1761836325
+   Set C_HELPER_KEY environment variable to use a custom key
+
+🚀 Starting c-helper API server...
+   URL: http://0.0.0.0:8888
+   Key: dev-1761836325
+   DB:  /home/steve/Downloads/c-helper/c-helper.db
+
+Press Ctrl+C to stop
+
+[Thu Oct 30 14:58:45 2025] Failed to listen on 0.0.0.0:8888 (reason: Address already in use)
+🔑 Generated API Key: dev-1761836469
+   Set C_HELPER_KEY environment variable to use a custom key
+
+🚀 Starting c-helper API server...
+   URL: http://0.0.0.0:8888
+   Key: dev-1761836469
+   DB:  /home/steve/Downloads/c-helper/c-helper.db
+
+Press Ctrl+C to stop
+
+[Thu Oct 30 15:01:09 2025] PHP 8.3.6 Development Server (http://0.0.0.0:8888) started

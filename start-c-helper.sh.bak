@@ -1,0 +1,23 @@
+#!/bin/bash
+# c-helper startup script
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Generate API key if not set
+if [ -z "$C_HELPER_KEY" ]; then
+    export C_HELPER_KEY="dev-$(date +%s)"
+    echo "🔑 Generated API Key: $C_HELPER_KEY"
+    echo "   Set C_HELPER_KEY environment variable to use a custom key"
+    echo ""
+fi
+
+echo "🚀 Starting c-helper API server..."
+echo "   URL: http://0.0.0.0:8888"
+echo "   Key: $C_HELPER_KEY"
+echo "   DB:  $SCRIPT_DIR/c-helper.db"
+echo ""
+echo "Press Ctrl+C to stop"
+echo ""
+
+php -S 0.0.0.0:8888 c-helper.php
